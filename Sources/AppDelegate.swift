@@ -47,7 +47,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let editItem = NSMenuItem(title: "Edit", action: nil, keyEquivalent: "")
         editItem.submenu = edit
         let main = NSMenu()
-        main.addItem(NSMenuItem(title: "TodoNotch", action: nil, keyEquivalent: ""))
+        let appMenu = NSMenu(title: "TodoNotch")
+        appMenu.addItem(withTitle: "Settings…", action: #selector(openSettings), keyEquivalent: ",").target = self
+        appMenu.addItem(withTitle: "Quit TodoNotch", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        let appItem = NSMenuItem(title: "TodoNotch", action: nil, keyEquivalent: "")
+        appItem.submenu = appMenu
+        main.addItem(appItem)
         main.addItem(editItem)
         NSApp.mainMenu = main
     }
@@ -124,6 +129,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func openSettings() {
         if settings == nil { settings = SettingsWindowController(panelController: controller) }
         settings?.show()
+        hidePanel()
     }
 
     @objc private func openFile() {

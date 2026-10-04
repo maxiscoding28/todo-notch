@@ -22,7 +22,7 @@ final class TodoPanelController: NSObject, NSTextFieldDelegate {
     private let headerLabel = NSTextField(labelWithString: "")
     private let scrollView = NSScrollView()
     private let rowsView = RowsView()
-    private let hintLabel = NSTextField(labelWithString: "↑↓ move  ·  ↩ add  ·  ⇥ nest  ·  esc close")
+    private let hintLabel = NSTextField(labelWithString: "↑↓ move  ·  ↩ add  ·  ⇥ nest  ·  ⌘, settings")
     private let loginBox = NSButton(checkboxWithTitle: "Open at login", target: nil, action: nil)
 
     private var file = TodoFile(sections: [], items: [])

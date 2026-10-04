@@ -40,6 +40,7 @@ xattr -d com.apple.quarantine /Applications/TodoNotch.app
 | ⌘A, then Delete | Clear the task. If it has sub-tasks, the app asks first |
 | Delete on an empty task | Remove it |
 | Esc | Close |
+| ⌘, | Open Settings |
 
 Click a section title to fold it. A section with no tasks stays folded. Click it to add the first task.
 
@@ -49,7 +50,7 @@ If the menu bar is full, macOS can hide the icon behind the notch. Use ⌃⌥T i
 
 ## Settings
 
-**Settings…** sets two things:
+Open Settings with ⌘, while the panel is open, or right-click the menu bar icon. Settings sets two things:
 
 - **Todo file**: the text file to use. The default is `~/todo.txt`. The app creates it if it does not exist.
 - **Sections from folders**:
