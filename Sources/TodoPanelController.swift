@@ -149,13 +149,13 @@ final class TodoPanelController: NSObject, NSTextFieldDelegate {
         var rows: [NSView] = []
         for section in file.sections {
             let items = file.items.filter { $0.section == section }
-            let open = items.filter { $0.depth == 0 && !$0.checked }.count
+            let open = items.filter(Self.isOpenTask).count
             let folded = isCollapsed(section)
             let header = SectionHeaderView(
                 title: section,
                 collapsed: folded,
                 badge: folded && open > 0 ? open : nil,
-                empty: items.isEmpty
+                empty: !items.contains { !Self.isBlank($0) }
             )
             header.onClick = { [weak self] in self?.headerClicked(section) }
             rows.append(header)
@@ -163,7 +163,7 @@ final class TodoPanelController: NSObject, NSTextFieldDelegate {
         }
         rowsView.setRows(rows)
 
-        let openCount = file.items.filter { $0.depth == 0 && !$0.checked }.count
+        let openCount = file.items.filter(Self.isOpenTask).count
         headerLabel.stringValue = Self.dateFormatter.string(from: Date())
             + "   ·   \(openCount) open"
 
@@ -201,6 +201,27 @@ final class TodoPanelController: NSObject, NSTextFieldDelegate {
     /// An empty section is always collapsed. Other sections follow the saved fold state.
     private func isCollapsed(_ section: String) -> Bool {
         !file.items.contains { $0.section == section } || collapsed.contains(section)
+    }
+
+    private static func isBlank(_ item: TodoItem) -> Bool {
+        item.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    /// An unchecked top-level task with text. Badges and the header count only these.
+    private static func isOpenTask(_ item: TodoItem) -> Bool {
+        item.depth == 0 && !item.checked && !isBlank(item)
+    }
+
+    /// Removes blank tasks with no sub-tasks from a section. These are drafts the user did not fill in.
+    private func dropBlankDrafts(in section: String) {
+        var i = 0
+        while i < file.items.count {
+            if file.items[i].section == section, Self.isBlank(file.items[i]), subtaskCount(at: i) == 0 {
+                file.items.remove(at: i)
+            } else {
+                i += 1
+            }
+        }
     }
 
     private func setCollapsed(_ section: String, _ value: Bool) {
@@ -253,7 +274,9 @@ final class TodoPanelController: NSObject, NSTextFieldDelegate {
     private func headerClicked(_ section: String) {
         _ = commitFocusedText()
         if file.items.contains(where: { $0.section == section }) {
-            setCollapsed(section, !collapsed.contains(section))
+            let collapsing = !collapsed.contains(section)
+            if collapsing { dropBlankDrafts(in: section) }
+            setCollapsed(section, collapsing)
             saveNonEmpty()
             rebuild()
         } else {
