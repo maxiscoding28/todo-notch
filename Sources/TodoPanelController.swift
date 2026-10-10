@@ -1,7 +1,6 @@
 import AppKit
-import ServiceManagement
 
-final class TodoPanelController: NSObject, NSTextFieldDelegate {
+final class TodoPanelController: NSObject, NSTextFieldDelegate, NSWindowDelegate {
     var onHeightChange: (() -> Void)?
     var onClose: (() -> Void)?
 
@@ -22,21 +21,34 @@ final class TodoPanelController: NSObject, NSTextFieldDelegate {
     private let headerLabel = NSTextField(labelWithString: "")
     private let scrollView = NSScrollView()
     private let rowsView = RowsView()
-    private let hintLabel = NSTextField(labelWithString: "↑↓ move  ·  ↩ add  ·  ⇥ nest  ·  ⌘, settings")
-    private let loginBox = NSButton(checkboxWithTitle: "Open at login", target: nil, action: nil)
+    private let hintLabel = NSTextField(labelWithString: "↑↓ move  ·  ↩ add  ·  ⇥ nest  ·  ⇧⌘L layout")
 
     private var file = TodoFile(sections: [], items: [])
+    private var diskBase = TodoFile(sections: [], items: [])
+    private var pendingDiskRefresh = false
+    private var rowCache: [UUID: TodoRowView] = [:]
+    private var headerCache: [String: SectionHeaderView] = [:]
+    private var displayOrder: [String] = []
+    private var conflictAlert: NSAlert?
+    private var deletionAlert: NSAlert?
+    private var completionTokens: [UUID: UUID] = [:]
+    private var sourceSections: [String] = []
+    private let fieldEditor = TodoFieldEditor()
     private static let collapsedKey = "collapsedSections"
     private var collapsed = Set(UserDefaults.standard.stringArray(forKey: TodoPanelController.collapsedKey) ?? [])
+    private var collapsedItems = Set<UUID>()
     private var lastKnownContent: String?
     private var watcher: FileWatcher?
     private var keyMonitor: Any?
     private var isRebuilding = false
     private var pendingDelete: (id: UUID, focus: UUID?, focusPrevious: Bool)?
-    private var overlay: NSView?
+    private var pendingCompletionDeletes: [UUID: DispatchWorkItem] = [:]
 
     /// The row field that holds the cursor. Reads the window's first responder, so it is correct before any typing.
     private var currentEditingField: ItemTextField? {
+        if let editor = view.window?.firstResponder as? NSTextView {
+            if let field = rowCache.values.first(where: { $0.field.currentEditor() === editor })?.field { return field }
+        }
         guard let responder = view.window?.firstResponder as? NSView else { return nil }
         var node: NSView? = responder
         while let current = node {
@@ -52,7 +64,8 @@ final class TodoPanelController: NSObject, NSTextFieldDelegate {
         return f
     }()
 
-    override init() {
+    init(configuration: Config = Config.load()) {
+        config = configuration
         super.init()
         buildUI()
         startWatching()
@@ -64,8 +77,18 @@ final class TodoPanelController: NSObject, NSTextFieldDelegate {
     /// Loads the file at the configured path and watches it. Creates the file when it does not exist.
     private func startWatching() {
         watcher?.stop()
+        pendingCompletionDeletes.values.forEach { $0.cancel() }
+        pendingCompletionDeletes.removeAll()
+        completionTokens.removeAll()
+        rowCache.removeAll()
+        headerCache.removeAll()
+        collapsedItems.removeAll()
+        displayOrder = []
+        view.window?.undoManager?.removeAllActions()
         lastKnownContent = nil
         file = TodoFile(sections: [], items: [])
+        diskBase = file
+        pendingDiskRefresh = false
         if !FileManager.default.fileExists(atPath: fileURL.path) {
             var empty = TodoFile(sections: [], items: [])
             empty.conform(to: requiredSections())
@@ -83,11 +106,14 @@ final class TodoPanelController: NSObject, NSTextFieldDelegate {
 
     @objc private func configChanged() {
         let previousFile = fileURL
+        let previousLayout = config.sectionLayout
         config = Config.load()
+        sourceSections = config.requiredSections()
         if fileURL != previousFile {
             startWatching()
         } else {
             syncSections()
+            if config.sectionLayout != previousLayout { rebuild(resetScrollPosition: true) }
         }
     }
 
@@ -100,14 +126,8 @@ final class TodoPanelController: NSObject, NSTextFieldDelegate {
         hintLabel.font = .systemFont(ofSize: 10)
         hintLabel.textColor = .secondaryLabelColor
 
-        loginBox.font = .systemFont(ofSize: 10)
-        loginBox.controlSize = .mini
-        loginBox.target = self
-        loginBox.action = #selector(loginToggled(_:))
-        loginBox.state = SMAppService.mainApp.status == .enabled ? .on : .off
-
         scrollView.hasVerticalScroller = true
-        scrollView.hasHorizontalScroller = false
+        scrollView.hasHorizontalScroller = config.sectionLayout == .horizontal
         scrollView.autohidesScrollers = true
         scrollView.drawsBackground = false
         scrollView.borderType = .noBorder
@@ -116,7 +136,7 @@ final class TodoPanelController: NSObject, NSTextFieldDelegate {
         rowsView.autoresizingMask = [.width]
         scrollView.documentView = rowsView
 
-        for v in [headerLabel, scrollView, hintLabel, loginBox] as [NSView] {
+        for v in [headerLabel, scrollView, hintLabel] as [NSView] {
             v.translatesAutoresizingMaskIntoConstraints = false
             view.addSubview(v)
         }
@@ -130,38 +150,91 @@ final class TodoPanelController: NSObject, NSTextFieldDelegate {
             scrollView.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -6),
             scrollView.bottomAnchor.constraint(equalTo: hintLabel.topAnchor, constant: -8),
             hintLabel.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 14),
+            hintLabel.trailingAnchor.constraint(lessThanOrEqualTo: view.trailingAnchor, constant: -14),
             hintLabel.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -10),
-            loginBox.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12),
-            loginBox.centerYAnchor.constraint(equalTo: hintLabel.centerYAnchor),
         ])
     }
 
     func preferredHeight() -> CGFloat {
-        let rows = CGFloat(max(rowsView.rows.count, 1))
-        let rowsHeight = min(rows * RowsView.rowHeight + 4, 520)
+        let scrollerHeight: CGFloat = config.sectionLayout == .horizontal ? 14 : 0
+        let rowsHeight = min(rowsView.preferredHeight + scrollerHeight + 4, 520)
         return 12 + 18 + 6 + rowsHeight + 8 + 14 + 10
     }
 
-    private func rebuild(focus: UUID? = nil) {
-        isRebuilding = true
-        view.window?.makeFirstResponder(nil)
+    func preferredWidth() -> CGFloat {
+        config.sectionLayout == .horizontal ? max(380, rowsView.preferredWidth + 12) : 380
+    }
 
-        var rows: [NSView] = []
-        for section in file.sections {
-            let items = file.items.filter { $0.section == section }
+    private func rebuild(
+        focus: UUID? = nil,
+        cursorAtStart: Bool = false,
+        resetScrollPosition: Bool = false
+    ) {
+        let active = currentEditingField
+        let activeID = active?.itemId
+        let selection = active?.currentEditor()?.selectedRange
+        if active != nil { _ = commitFocusedText() }
+        let anchor = rowsView.rows.first { $0.frame.intersects(scrollView.contentView.bounds) }
+        let anchorOffset = anchor.map {
+            NSPoint(x: scrollView.contentView.bounds.minX - $0.frame.minX,
+                    y: scrollView.contentView.bounds.minY - $0.frame.minY)
+        }
+        isRebuilding = true
+        let liveIDs = Set(file.items.map(\.id))
+        rowCache = rowCache.filter { liveIDs.contains($0.key) }
+        collapsedItems.formIntersection(liveIDs)
+        headerCache = headerCache.filter { file.sections.contains($0.key) }
+        let sorted = file.sectionsByDescendingTodoCount()
+        if activeID == nil || resetScrollPosition { displayOrder = sorted }
+        else {
+            displayOrder = displayOrder.filter { file.sections.contains($0) }
+            displayOrder += sorted.filter { !displayOrder.contains($0) }
+        }
+        let grouped = Dictionary(grouping: file.items, by: \.section)
+
+        var sectionRows: [[NSView]] = []
+        for section in displayOrder {
+            var rows: [NSView] = []
+            let items = grouped[section] ?? []
             let open = items.filter(Self.isOpenTask).count
             let folded = isCollapsed(section)
-            let header = SectionHeaderView(
+            let header = headerCache[section] ?? SectionHeaderView(
                 title: section,
                 collapsed: folded,
                 badge: folded && open > 0 ? open : nil,
                 empty: !items.contains { !Self.isBlank($0) }
             )
+            header.update(title: section, collapsed: folded, badge: folded && open > 0 ? open : nil,
+                          empty: !items.contains { !Self.isBlank($0) })
+            headerCache[section] = header
             header.onClick = { [weak self] in self?.headerClicked(section) }
             rows.append(header)
-            if !folded { rows += items.map(makeRow) }
+            if !folded {
+                var collapsedDepth: Int?
+                for (offset, item) in items.enumerated() {
+                    if let depth = collapsedDepth {
+                        if item.depth > depth { continue }
+                        collapsedDepth = nil
+                    }
+                    let hasSubtasks = offset + 1 < items.count && items[offset + 1].depth > item.depth
+                    let itemCollapsed = hasSubtasks ? collapsedItems.contains(item.id) : nil
+                    rows.append(makeRow(item, collapsed: itemCollapsed))
+                    if itemCollapsed == true { collapsedDepth = item.depth }
+                }
+            }
+            sectionRows.append(rows)
         }
-        rowsView.setRows(rows)
+        let horizontal = config.sectionLayout == .horizontal
+        let visibleIDs = Set(sectionRows.flatMap { $0 }.compactMap { ($0 as? TodoRowView)?.itemId })
+        if resetScrollPosition || activeID.map({ !visibleIDs.contains($0) }) == true {
+            view.window?.makeFirstResponder(nil)
+        }
+        scrollView.hasHorizontalScroller = horizontal
+        rowsView.setSections(sectionRows, horizontal: horizontal)
+        if resetScrollPosition {
+            scrollView.contentView.scroll(to: .zero)
+            scrollView.reflectScrolledClipView(scrollView.contentView)
+        }
 
         let openCount = file.items.filter(Self.isOpenTask).count
         headerLabel.stringValue = Self.dateFormatter.string(from: Date())
@@ -169,29 +242,38 @@ final class TodoPanelController: NSObject, NSTextFieldDelegate {
 
         isRebuilding = false
         onHeightChange?()
+        view.layoutSubtreeIfNeeded()
+        if !resetScrollPosition, let anchor, anchor.superview === rowsView, let anchorOffset {
+            scrollView.contentView.scroll(to: NSPoint(x: max(0, anchor.frame.minX + anchorOffset.x),
+                                                     y: max(0, anchor.frame.minY + anchorOffset.y)))
+            scrollView.reflectScrolledClipView(scrollView.contentView)
+        }
 
-        if let focus, let row = rows.compactMap({ $0 as? TodoRowView }).first(where: { $0.itemId == focus }) {
+        if let focus, let row = rowCache[focus], row.superview === rowsView {
             view.layoutSubtreeIfNeeded()
             view.window?.makeFirstResponder(row.field)
-            placeCursorAtEnd(row.field)
+            if cursorAtStart {
+                row.field.currentEditor()?.selectedRange = NSRange(location: 0, length: 0)
+            } else {
+                placeCursorAtEnd(row.field)
+            }
+            scrollToVisible(row)
+        } else if resetScrollPosition, let activeID, let row = rowCache[activeID], row.superview === rowsView {
+            view.window?.makeFirstResponder(row.field)
+            if let selection { row.field.currentEditor()?.selectedRange = selection }
             scrollToVisible(row)
         }
     }
 
-    private func makeRow(_ item: TodoItem) -> TodoRowView {
-        let row = TodoRowView(itemId: item.id, indent: 26 + CGFloat(item.depth) * 20)
-        row.checkbox.state = item.checked ? .on : .off
+    private func makeRow(_ item: TodoItem, collapsed: Bool?) -> TodoRowView {
+        let row = rowCache[item.id] ?? TodoRowView(
+            itemId: item.id, indent: 26 + CGFloat(item.depth) * 20, collapsed: collapsed
+        )
+        rowCache[item.id] = row
+        row.update(item, collapsed: collapsed)
+        row.onToggle = { [weak self] in self?.toggleSubtasks(for: item.id) }
         row.checkbox.target = self
         row.checkbox.action = #selector(toggleCheck(_:))
-        if item.checked {
-            row.field.attributedStringValue = NSAttributedString(string: item.text, attributes: [
-                .font: NSFont.systemFont(ofSize: 13),
-                .strikethroughStyle: NSUnderlineStyle.single.rawValue,
-                .foregroundColor: NSColor.secondaryLabelColor,
-            ])
-        } else {
-            row.field.stringValue = item.text
-        }
         row.field.delegate = self
         return row
     }
@@ -204,12 +286,12 @@ final class TodoPanelController: NSObject, NSTextFieldDelegate {
     }
 
     private static func isBlank(_ item: TodoItem) -> Bool {
-        item.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        item.isBlank
     }
 
     /// An unchecked top-level task with text. Badges and the header count only these.
     private static func isOpenTask(_ item: TodoItem) -> Bool {
-        item.depth == 0 && !item.checked && !isBlank(item)
+        item.isOpenTask
     }
 
     /// Removes blank tasks with no sub-tasks from a section. These are drafts the user did not fill in.
@@ -231,11 +313,12 @@ final class TodoPanelController: NSObject, NSTextFieldDelegate {
 
     /// Section names from the configured folder sources.
     private func requiredSections() -> [String] {
-        config.requiredSections()
+        if sourceSections.isEmpty { sourceSections = config.requiredSections() }
+        return sourceSections
     }
 
     /// What applying `newConfig` does to the section list of its todo file. Tasks are never removed.
-    func preview(_ newConfig: Config) -> ConfigPreview {
+    func preview(_ newConfig: Config, required: [String]? = nil) -> ConfigPreview {
         let current: TodoFile
         if newConfig.todoURL == fileURL {
             current = file
@@ -244,13 +327,13 @@ final class TodoPanelController: NSObject, NSTextFieldDelegate {
         } else {
             current = TodoFile(sections: [], items: [])
         }
-        let newRequired = newConfig.requiredSections()
+        let newRequired = required ?? newConfig.requiredSections()
         var after = current
         after.conform(to: newRequired)
         let before = Set(current.sections)
         let afterSet = Set(after.sections)
         let required = Set(newRequired)
-        let oldRequired = Set(config.requiredSections())
+        let oldRequired = Set(requiredSections())
         return ConfigPreview(
             sections: after.sections,
             added: after.sections.filter { !before.contains($0) },
@@ -263,6 +346,7 @@ final class TodoPanelController: NSObject, NSTextFieldDelegate {
     /// Adds sections for new source folders. Saves only when the structure changes.
     func syncSections() {
         guard !isEditing else { return }
+        sourceSections = config.requiredSections()
         let before = file.serialize()
         file.conform(to: requiredSections())
         if file.serialize() != before {
@@ -287,47 +371,70 @@ final class TodoPanelController: NSObject, NSTextFieldDelegate {
         }
     }
 
+    private func toggleSubtasks(for id: UUID) {
+        _ = commitFocusedText()
+        if collapsedItems.contains(id) {
+            collapsedItems.remove(id)
+        } else {
+            collapsedItems.insert(id)
+        }
+        saveNonEmpty()
+        rebuild()
+    }
+
+    private func toggleLayout() {
+        _ = commitFocusedText()
+        saveNonEmpty()
+        var updated = config
+        updated.sectionLayout = config.sectionLayout == .vertical ? .horizontal : .vertical
+        updated.save()
+    }
+
     private func scrollToVisible(_ row: TodoRowView) {
         let clip = scrollView.contentView
         var origin = clip.bounds.origin
         let r = row.frame
+        if r.maxX > origin.x + clip.bounds.width {
+            origin.x = r.maxX - clip.bounds.width
+        } else if r.minX < origin.x {
+            origin.x = r.minX
+        }
         if r.maxY > origin.y + clip.bounds.height {
             origin.y = r.maxY - clip.bounds.height
         } else if r.minY < origin.y {
             origin.y = r.minY
         }
-        clip.scroll(to: NSPoint(x: 0, y: max(0, origin.y)))
+        clip.scroll(to: NSPoint(x: max(0, origin.x), y: max(0, origin.y)))
         scrollView.reflectScrolledClipView(clip)
     }
 
     // MARK: File
 
     func refreshFromDisk() {
-        guard !isEditing, let content = try? String(contentsOf: fileURL, encoding: .utf8) else { return }
+        guard let content = try? String(contentsOf: fileURL, encoding: .utf8) else { return }
         guard content != lastKnownContent else { return }
+        guard !isEditing, pendingDelete == nil, conflictAlert == nil else { pendingDiskRefresh = true; return }
+        var remote = TodoFile.parse(content)
+        remote.reconcile(with: diskBase)
+        guard let merged = TodoFile.merge(base: diskBase, local: file, remote: remote) else {
+            showFileConflict(remote: remote, content: content)
+            return
+        }
         lastKnownContent = content
-        file = TodoFile.parse(content)
+        diskBase = remote
+        pendingDiskRefresh = false
+        file = merged
         file.conform(to: requiredSections())
         if file.serialize() != content { saveNonEmpty() }
+        scheduleLoadedCompletions()
         rebuild()
     }
 
     private var isEditing: Bool { currentEditingField != nil }
 
-    private func save() {
-        let content = file.serialize()
-        do {
-            try content.write(to: fileURL, atomically: true, encoding: .utf8)
-            lastKnownContent = content
-        } catch {
-            NSSound.beep()
-        }
-    }
-
     // MARK: Panel lifecycle
 
     func panelDidOpen() {
-        loginBox.state = SMAppService.mainApp.status == .enabled ? .on : .off
         syncSections()
         guard keyMonitor == nil else { return }
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown]) { [weak self] event in
@@ -353,8 +460,9 @@ final class TodoPanelController: NSObject, NSTextFieldDelegate {
         isRebuilding = false
         file.items.removeAll { $0.text.isEmpty }
         if file.serialize() != lastKnownContent {
-            save()
+            saveNonEmpty()
         }
+        if pendingDiskRefresh { refreshFromDisk() }
         rebuild()
     }
 
@@ -368,6 +476,11 @@ final class TodoPanelController: NSObject, NSTextFieldDelegate {
             case 53: cancelPendingDelete()
             default: break
             }
+            return true
+        }
+        if event.keyCode == 37, flags.contains([.command, .shift]),
+           !flags.contains(.option), !flags.contains(.control) {
+            toggleLayout()
             return true
         }
         if flags.contains(.command) { return false }
@@ -448,13 +561,29 @@ final class TodoPanelController: NSObject, NSTextFieldDelegate {
 
     private func returnPressed() {
         let item: TodoItem
-        if let idx = commitFocusedText() {
+        var cursorAtStart = false
+        if let field = currentEditingField, let idx = index(of: field) {
+            let text = field.stringValue as NSString
+            let length = text.length
+            let selected = field.currentEditor()?.selectedRange ?? NSRange(location: length, length: 0)
+            let location = selected.location == NSNotFound ? length : min(selected.location, length)
+            let selectionEnd = location + min(selected.length, length - location)
             let base = file.items[idx].depth
             let section = file.items[idx].section
-            var end = idx + 1
-            while end < file.items.count, file.items[end].section == section, file.items[end].depth > base { end += 1 }
-            item = TodoItem(text: "", depth: base, section: section)
-            file.items.insert(item, at: end)
+            if location == 0, selected.length == 0 {
+                file.items[idx].text = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+                item = TodoItem(text: "", depth: base, section: section)
+                file.items.insert(item, at: idx)
+            } else {
+                file.items[idx].text = text.substring(to: location)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                let remainder = text.substring(from: selectionEnd)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                let end = file.subtreeRange(at: idx).upperBound
+                item = TodoItem(text: remainder, depth: base, section: section)
+                file.items.insert(item, at: end)
+                cursorAtStart = !remainder.isEmpty
+            }
         } else {
             guard let section = file.sections.first(where: { !isCollapsed($0) }) ?? file.sections.first else { return }
             setCollapsed(section, false)
@@ -462,7 +591,7 @@ final class TodoPanelController: NSObject, NSTextFieldDelegate {
             file.items.insert(item, at: file.endIndex(of: section))
         }
         saveNonEmpty()
-        rebuild(focus: item.id)
+        rebuild(focus: item.id, cursorAtStart: cursorAtStart)
     }
 
     private func shiftFocused(by delta: Int) {
@@ -474,10 +603,8 @@ final class TodoPanelController: NSObject, NSTextFieldDelegate {
         } else {
             guard base > 0 else { return }
         }
-        var i = idx
-        while i < file.items.count, i == idx || (file.items[i].section == section && file.items[i].depth > base) {
+        for i in file.subtreeRange(at: idx) {
             file.items[i].depth = max(0, file.items[i].depth + delta)
-            i += 1
         }
         saveNonEmpty()
         rebuild(focus: file.items[idx].id)
@@ -490,11 +617,7 @@ final class TodoPanelController: NSObject, NSTextFieldDelegate {
 
     /// The number of sub-tasks under the item at `index`.
     private func subtaskCount(at index: Int) -> Int {
-        let base = file.items[index].depth
-        let section = file.items[index].section
-        var end = index + 1
-        while end < file.items.count, file.items[end].section == section, file.items[end].depth > base { end += 1 }
-        return end - index - 1
+        file.subtreeRange(at: index).count - 1
     }
 
     /// Deletes a task at once when it has no sub-tasks. Else shows the confirm overlay first.
@@ -516,6 +639,8 @@ final class TodoPanelController: NSObject, NSTextFieldDelegate {
     }
 
     private func performDelete(id: UUID, focus: UUID?, focusPrevious: Bool) {
+        _ = commitFocusedText()
+        guard prepareToWrite() else { return }
         guard let idx = file.items.firstIndex(where: { $0.id == id }) else { return }
         var target = focus
         if focusPrevious, idx > 0, file.items[idx - 1].section == file.items[idx].section {
@@ -541,84 +666,138 @@ final class TodoPanelController: NSObject, NSTextFieldDelegate {
 
     private func hideOverlay() {
         pendingDelete = nil
-        overlay?.removeFromSuperview()
-        overlay = nil
+        if let alert = deletionAlert {
+            alert.window.sheetParent?.endSheet(alert.window)
+            deletionAlert = nil
+        }
     }
 
     private func showOverlay(title: String, detail: String) {
-        overlay?.removeFromSuperview()
-        let dim = OverlayView()
-        dim.wantsLayer = true
-        dim.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.45).cgColor
-        dim.translatesAutoresizingMaskIntoConstraints = false
-
-        let card = NSView()
-        card.wantsLayer = true
-        card.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
-        card.layer?.cornerRadius = 10
-        card.layer?.borderWidth = 0.5
-        card.layer?.borderColor = NSColor.separatorColor.cgColor
-        card.translatesAutoresizingMaskIntoConstraints = false
-
-        let titleLabel = NSTextField(labelWithString: title)
-        titleLabel.font = .systemFont(ofSize: 13, weight: .semibold)
-        let detailLabel = NSTextField(labelWithString: detail.isEmpty ? "This task has no text." : detail)
-        detailLabel.font = .systemFont(ofSize: 11)
-        detailLabel.textColor = .secondaryLabelColor
-        detailLabel.lineBreakMode = .byTruncatingTail
-        detailLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-
-        let cancel = NSButton(title: "Cancel  esc", target: self, action: #selector(cancelPendingDelete))
-        let delete = NSButton(title: "Delete  ↩", target: self, action: #selector(confirmPendingDelete))
-        delete.hasDestructiveAction = true
-        delete.keyEquivalent = "\r"
-        for b in [cancel, delete] {
-            b.bezelStyle = .rounded
-            b.controlSize = .small
-            b.font = .systemFont(ofSize: 11)
-            b.refusesFirstResponder = true
+        guard let window = view.window else { cancelPendingDelete(); return }
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = detail
+        alert.addButton(withTitle: "Delete")
+        alert.addButton(withTitle: "Cancel")
+        deletionAlert = alert
+        alert.beginSheetModal(for: window) { [weak self] response in
+            guard let self, self.pendingDelete != nil else { return }
+            if response == .alertFirstButtonReturn { self.confirmPendingDelete() }
+            else { self.cancelPendingDelete() }
         }
-
-        for v in [titleLabel, detailLabel, cancel, delete] as [NSView] {
-            v.translatesAutoresizingMaskIntoConstraints = false
-            card.addSubview(v)
-        }
-        dim.addSubview(card)
-        view.addSubview(dim)
-
-        NSLayoutConstraint.activate([
-            dim.topAnchor.constraint(equalTo: view.topAnchor),
-            dim.bottomAnchor.constraint(equalTo: view.bottomAnchor),
-            dim.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-            dim.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-            card.centerXAnchor.constraint(equalTo: dim.centerXAnchor),
-            card.centerYAnchor.constraint(equalTo: dim.centerYAnchor),
-            card.widthAnchor.constraint(equalTo: dim.widthAnchor, constant: -40),
-            titleLabel.topAnchor.constraint(equalTo: card.topAnchor, constant: 12),
-            titleLabel.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 14),
-            titleLabel.trailingAnchor.constraint(lessThanOrEqualTo: card.trailingAnchor, constant: -14),
-            detailLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 3),
-            detailLabel.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
-            detailLabel.trailingAnchor.constraint(lessThanOrEqualTo: card.trailingAnchor, constant: -14),
-            delete.topAnchor.constraint(equalTo: detailLabel.bottomAnchor, constant: 10),
-            delete.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -12),
-            delete.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -10),
-            cancel.centerYAnchor.constraint(equalTo: delete.centerYAnchor),
-            cancel.trailingAnchor.constraint(equalTo: delete.leadingAnchor, constant: -8),
-        ])
-        overlay = dim
     }
 
     private func deleteSubtree(at index: Int) {
-        let base = file.items[index].depth
-        let section = file.items[index].section
-        var end = index + 1
-        while end < file.items.count, file.items[end].section == section, file.items[end].depth > base { end += 1 }
-        file.items.removeSubrange(index..<end)
+        let removal = file.removeSubtree(at: index)
+        cancelCompletions(for: removal.items)
+        registerRestoration(removal, name: "Delete Task")
+    }
+
+    private func scheduleCompletionDelete(id: UUID) {
+        pendingCompletionDeletes.removeValue(forKey: id)?.cancel()
+        let token = UUID()
+        completionTokens[id] = token
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.completionTokens[id] == token else { return }
+            self.fadeCompletedItem(id: id)
+        }
+        pendingCompletionDeletes[id] = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5, execute: work)
+    }
+
+    private func fadeCompletedItem(id: UUID) {
+        if pendingDelete != nil || conflictAlert != nil {
+            scheduleCompletionDelete(id: id)
+            return
+        }
+        guard let idx = file.items.firstIndex(where: { $0.id == id }), file.items[idx].checked else {
+            pendingCompletionDeletes.removeValue(forKey: id)
+            return
+        }
+        let token = completionTokens[id]
+        let row = rowCache[id]
+        guard view.window?.isVisible == true, let row else {
+            deleteCompletedItem(id: id)
+            return
+        }
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 0 : 0.25
+            row.animator().alphaValue = 0
+        } completionHandler: { [weak self] in
+            guard let self, self.completionTokens[id] == token else { return }
+            self.deleteCompletedItem(id: id)
+        }
+    }
+
+    private func deleteCompletedItem(id: UUID) {
+        if pendingDelete != nil || conflictAlert != nil { scheduleCompletionDelete(id: id); return }
+        _ = commitFocusedText()
+        guard prepareToWrite() else { scheduleCompletionDelete(id: id); return }
+        pendingCompletionDeletes.removeValue(forKey: id)
+        guard let idx = file.items.firstIndex(where: { $0.id == id }), file.items[idx].checked else { return }
+        var removal = file.removeSubtree(at: idx)
+        cancelCompletions(for: removal.items)
+        removal.items[0].checked = false
+        registerRestoration(removal, name: "Complete Task")
+        saveNonEmpty()
+        rebuild()
+    }
+
+    private func registerRestoration(_ removal: TodoFile.Removal, name: String) {
+        guard let manager = view.window?.undoManager else { return }
+        if !manager.isUndoing && !manager.isRedoing {
+            (currentEditingField?.currentEditor() as? NSTextView)?.breakUndoCoalescing()
+            while manager.groupingLevel > 0 { manager.endUndoGrouping() }
+            manager.beginUndoGrouping()
+        }
+        manager.registerUndo(withTarget: self) { target in target.restoreRemoval(removal, name: name) }
+        manager.setActionName(name)
+        if !manager.isUndoing && !manager.isRedoing { manager.endUndoGrouping() }
+    }
+
+    private func restoreRemoval(_ removal: TodoFile.Removal, name: String) {
+        _ = commitFocusedText()
+        guard prepareToWrite(), let first = removal.items.first else { return }
+        file.restore(removal)
+        setCollapsed(first.section, false)
+        if let parent = removal.parent { collapsedItems.remove(parent) }
+        view.window?.undoManager?.registerUndo(withTarget: self) { target in
+            _ = target.commitFocusedText()
+            guard target.prepareToWrite() else { return }
+            guard let index = target.file.items.firstIndex(where: { $0.id == first.id }) else { return }
+            let redo = target.file.removeSubtree(at: index)
+            target.cancelCompletions(for: redo.items)
+            target.registerRestoration(removal, name: name)
+            target.saveNonEmpty()
+            target.rebuild()
+        }
+        saveNonEmpty()
+        rebuild(focus: first.id)
+    }
+
+    private func cancelCompletions(for items: [TodoItem]) {
+        for item in items {
+            pendingCompletionDeletes.removeValue(forKey: item.id)?.cancel()
+            completionTokens.removeValue(forKey: item.id)
+            rowCache[item.id]?.alphaValue = 1
+        }
+    }
+
+    private func scheduleLoadedCompletions() {
+        cancelCompletions(for: file.items.filter { !$0.checked })
+        let ids = Set(file.items.map(\.id))
+        for id in Array(pendingCompletionDeletes.keys) where !ids.contains(id) {
+            pendingCompletionDeletes.removeValue(forKey: id)?.cancel()
+            completionTokens.removeValue(forKey: id)
+        }
+        for item in file.items where item.checked && pendingCompletionDeletes[item.id] == nil {
+            scheduleCompletionDelete(id: item.id)
+        }
     }
 
     /// Saves without empty draft items, so the file never holds blank todo lines.
     private func saveNonEmpty() {
+        guard prepareToWrite() else { return }
         var copy = file
         copy.items.removeAll { $0.text.isEmpty }
         let content = copy.serialize()
@@ -626,20 +805,87 @@ final class TodoPanelController: NSObject, NSTextFieldDelegate {
         do {
             try content.write(to: fileURL, atomically: true, encoding: .utf8)
             lastKnownContent = content
+            diskBase = copy
+            pendingDiskRefresh = false
         } catch {
             NSSound.beep()
         }
     }
 
+    private func prepareToWrite() -> Bool {
+        guard conflictAlert == nil else { return false }
+        do {
+            let content = try String(contentsOf: fileURL, encoding: .utf8)
+            guard content != lastKnownContent else { return true }
+            var remote = TodoFile.parse(content)
+            remote.reconcile(with: diskBase)
+            guard let merged = TodoFile.merge(base: diskBase, local: file, remote: remote) else {
+                showFileConflict(remote: remote, content: content)
+                return false
+            }
+            file = merged
+            diskBase = remote
+            lastKnownContent = content
+            pendingDiskRefresh = false
+            scheduleLoadedCompletions()
+            return true
+        } catch {
+            NSSound.beep()
+            return false
+        }
+    }
+
+    private func showFileConflict(remote: TodoFile, content: String) {
+        guard conflictAlert == nil else { return }
+        let alert = NSAlert()
+        alert.messageText = "The todo file changed outside TodoNotch."
+        alert.informativeText = "Both edits change the same task. Choose which version to keep."
+        alert.addButton(withTitle: "Use File Version")
+        alert.addButton(withTitle: "Keep App Version")
+        conflictAlert = alert
+        let resolve: (NSApplication.ModalResponse) -> Void = { [weak self] response in
+            guard let self else { return }
+            self.isRebuilding = true
+            self.view.window?.makeFirstResponder(nil)
+            self.isRebuilding = false
+            self.conflictAlert = nil
+            self.diskBase = remote
+            self.lastKnownContent = content
+            if response == .alertFirstButtonReturn { self.file = remote }
+            self.pendingDiskRefresh = false
+            self.saveNonEmpty()
+            self.scheduleLoadedCompletions()
+            self.rebuild()
+        }
+        if let window = view.window, window.isVisible { alert.beginSheetModal(for: window, completionHandler: resolve) }
+        else { resolve(alert.runModal()) }
+    }
+
     // MARK: Actions
+
+    func windowWillReturnFieldEditor(_ sender: NSWindow, to client: Any?) -> Any? {
+        guard client is ItemTextField else { return nil }
+        fieldEditor.isFieldEditor = true
+        fieldEditor.allowsUndo = true
+        fieldEditor.sharedUndoManager = sender.undoManager
+        return fieldEditor
+    }
+
+    func controlTextDidBeginEditing(_ obj: Notification) {
+        guard let field = obj.object as? ItemTextField, let editor = field.currentEditor() as? NSTextView else { return }
+        editor.allowsUndo = true
+        editor.breakUndoCoalescing()
+    }
 
     @objc private func toggleCheck(_ sender: NSButton) {
         guard let row = sender.superview as? TodoRowView,
               let id = row.itemId,
               let idx = file.items.firstIndex(where: { $0.id == id }) else { return }
         _ = commitFocusedText()
+        cancelCompletions(for: [file.items[idx]])
         file.items[idx].checked = sender.state == .on
         saveNonEmpty()
+        if sender.state == .on { scheduleCompletionDelete(id: id) }
         rebuild()
     }
 
@@ -655,27 +901,16 @@ final class TodoPanelController: NSObject, NSTextFieldDelegate {
         } else if text.isEmpty {
             deleteSubtree(at: idx)
         } else if text == file.items[idx].text {
-            return
+            // Refresh after the field editor releases its current task.
         } else {
             file.items[idx].text = text
         }
         saveNonEmpty()
         DispatchQueue.main.async { [weak self] in
             guard let self, !self.isEditing else { return }
+            if self.pendingDiskRefresh { self.refreshFromDisk() }
             self.rebuild()
         }
     }
 
-    @objc private func loginToggled(_ sender: NSButton) {
-        do {
-            if sender.state == .on {
-                try SMAppService.mainApp.register()
-            } else {
-                try SMAppService.mainApp.unregister()
-            }
-        } catch {
-            NSSound.beep()
-        }
-        sender.state = SMAppService.mainApp.status == .enabled ? .on : .off
-    }
 }

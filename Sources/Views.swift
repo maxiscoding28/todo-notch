@@ -1,24 +1,38 @@
 import AppKit
 
 final class DropdownPanel: NSPanel {
+    let actionUndoManager = UndoManager()
+    override var undoManager: UndoManager? { actionUndoManager }
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { false }
+}
+
+final class TodoFieldEditor: NSTextView {
+    weak var sharedUndoManager: UndoManager?
+    override var undoManager: UndoManager? { sharedUndoManager }
 }
 
 final class ItemTextField: NSTextField {
     var itemId: UUID?
 }
 
+final class FlippedView: NSView {
+    override var isFlipped: Bool { true }
+}
+
 final class TodoRowView: NSView {
     let itemId: UUID?
     let checkbox = NSButton(checkboxWithTitle: "", target: nil, action: nil)
     let field = ItemTextField(frame: .zero)
-    private let indent: CGFloat
+    var onToggle: (() -> Void)?
+    private var disclosure: NSButton?
+    private var indent: CGFloat
 
-    init(itemId: UUID?, indent: CGFloat) {
+    init(itemId: UUID?, indent: CGFloat, collapsed: Bool?) {
         self.itemId = itemId
         self.indent = indent
         super.init(frame: .zero)
+        updateDisclosure(collapsed)
         field.itemId = itemId
         field.isBordered = false
         field.drawsBackground = false
@@ -32,7 +46,45 @@ final class TodoRowView: NSView {
         addSubview(field)
     }
 
+    func update(_ item: TodoItem, collapsed: Bool?) {
+        indent = 26 + CGFloat(item.depth) * 20
+        updateDisclosure(collapsed)
+        checkbox.state = item.checked ? .on : .off
+        if field.currentEditor() == nil {
+            field.attributedStringValue = NSAttributedString(string: item.text, attributes: [
+                .font: NSFont.systemFont(ofSize: 13),
+                .foregroundColor: item.checked ? NSColor.secondaryLabelColor : NSColor.labelColor,
+                .strikethroughStyle: item.checked ? NSUnderlineStyle.single.rawValue : 0,
+            ])
+        }
+        needsLayout = true
+    }
+
+    private func updateDisclosure(_ collapsed: Bool?) {
+        if let collapsed {
+            let disclosure = self.disclosure ?? NSButton()
+            self.disclosure = disclosure
+            let symbol = collapsed ? "chevron.right" : "chevron.down"
+            disclosure.image = NSImage(systemSymbolName: symbol, accessibilityDescription: "Toggle sub-tasks")?
+                .withSymbolConfiguration(.init(pointSize: 8, weight: .semibold))
+            disclosure.contentTintColor = .secondaryLabelColor
+            disclosure.isBordered = false
+            disclosure.target = self
+            disclosure.action = #selector(toggleSubtasks)
+            disclosure.refusesFirstResponder = true
+            disclosure.toolTip = collapsed ? "Show sub-tasks" : "Hide sub-tasks"
+            addSubview(disclosure)
+        } else {
+            disclosure?.removeFromSuperview()
+            disclosure = nil
+        }
+    }
+
     required init?(coder: NSCoder) { fatalError("not supported") }
+
+    @objc private func toggleSubtasks() {
+        onToggle?()
+    }
 
     override func setFrameSize(_ newSize: NSSize) {
         super.setFrameSize(newSize)
@@ -41,9 +93,11 @@ final class TodoRowView: NSView {
 
     override func layout() {
         super.layout()
-        checkbox.frame = NSRect(x: indent, y: (bounds.height - 18) / 2, width: 18, height: 18)
-        let x = indent + 24
-        field.frame = NSRect(x: x, y: (bounds.height - 18) / 2, width: max(40, bounds.width - x - 8), height: 18)
+        let effectiveIndent = min(indent, max(26, bounds.width - 96))
+        disclosure?.frame = NSRect(x: effectiveIndent - 18, y: (bounds.height - 16) / 2, width: 16, height: 16)
+        checkbox.frame = NSRect(x: effectiveIndent, y: (bounds.height - 18) / 2, width: 18, height: 18)
+        let x = effectiveIndent + 24
+        field.frame = NSRect(x: x, y: (bounds.height - 18) / 2, width: max(0, bounds.width - x - 8), height: 18)
     }
 }
 
@@ -59,6 +113,15 @@ final class SectionHeaderView: NSView {
 
     init(title: String, collapsed: Bool, badge: Int?, empty: Bool) {
         super.init(frame: .zero)
+        titleLabel.lineBreakMode = .byTruncatingTail
+        addSubview(chevron)
+        addSubview(titleLabel)
+        addSubview(badgeView)
+        badgeView.addSubview(badgeLabel)
+        update(title: title, collapsed: collapsed, badge: badge, empty: empty)
+    }
+
+    func update(title: String, collapsed: Bool, badge: Int?, empty: Bool) {
         let symbol = collapsed ? "chevron.right" : "chevron.down"
         chevron.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?
             .withSymbolConfiguration(.init(pointSize: 9, weight: .semibold))
@@ -74,17 +137,15 @@ final class SectionHeaderView: NSView {
         badgeLabel.font = .systemFont(ofSize: 10, weight: .semibold)
         badgeLabel.textColor = .black
         badgeLabel.alignment = .center
-        badgeView.addSubview(badgeLabel)
         if let badge {
             badgeLabel.stringValue = "\(badge)"
+            badgeView.isHidden = false
         } else {
             badgeView.isHidden = true
         }
 
-        addSubview(chevron)
-        addSubview(titleLabel)
-        addSubview(badgeView)
         toolTip = empty ? "Click to add a todo" : "Click to fold"
+        needsLayout = true
     }
 
     required init?(coder: NSCoder) { fatalError("not supported") }
@@ -111,26 +172,48 @@ final class SectionHeaderView: NSView {
         let midY = bounds.height / 2
         chevron.frame = NSRect(x: 10, y: midY - 6, width: 12, height: 12)
         let titleSize = titleLabel.fittingSize
-        titleLabel.frame = NSRect(x: 28, y: midY - titleSize.height / 2, width: titleSize.width, height: titleSize.height)
         let textSize = badgeLabel.fittingSize
         let badgeWidth = max(18, textSize.width + 10)
+        let available = max(0, bounds.width - 36 - (badgeView.isHidden ? 0 : badgeWidth + 6))
+        titleLabel.frame = NSRect(x: 28, y: midY - titleSize.height / 2,
+                                 width: min(titleSize.width, available), height: titleSize.height)
         badgeView.frame = NSRect(x: titleLabel.frame.maxX + 6, y: midY - 7, width: badgeWidth, height: 14)
         badgeLabel.frame = NSRect(x: 0, y: (14 - textSize.height) / 2, width: badgeWidth, height: textSize.height)
     }
 }
 
-/// Flipped container that stacks rows from the top at a fixed height.
+/// Flipped container that arranges sections as one list or as columns.
 final class RowsView: NSView {
     static let rowHeight: CGFloat = 24
+    static let columnWidth: CGFloat = 300
     private(set) var rows: [NSView] = []
+    private var sections: [[NSView]] = []
+    private var horizontal = false
 
     override var isFlipped: Bool { true }
 
-    func setRows(_ newRows: [NSView]) {
-        rows.forEach { $0.removeFromSuperview() }
-        rows = newRows
-        rows.forEach { addSubview($0) }
-        setFrameSize(NSSize(width: frame.width, height: CGFloat(rows.count) * Self.rowHeight))
+    var preferredHeight: CGFloat {
+        let count = horizontal ? sections.map(\.count).max() ?? 0 : rows.count
+        return CGFloat(max(count, 1)) * Self.rowHeight
+    }
+
+    var preferredWidth: CGFloat {
+        horizontal ? CGFloat(max(sections.count, 1)) * Self.columnWidth : 360
+    }
+
+    func setSections(_ newSections: [[NSView]], horizontal: Bool) {
+        let nextRows = newSections.flatMap { $0 }
+        let nextIDs = Set(nextRows.map(ObjectIdentifier.init))
+        rows.filter { !nextIDs.contains(ObjectIdentifier($0)) }.forEach { $0.removeFromSuperview() }
+        sections = newSections
+        rows = nextRows
+        self.horizontal = horizontal
+        rows.filter { $0.superview !== self }.forEach { addSubview($0) }
+        autoresizingMask = horizontal ? [] : [.width]
+        setFrameSize(NSSize(
+            width: horizontal ? preferredWidth : max(frame.width, 360),
+            height: preferredHeight
+        ))
         needsLayout = true
     }
 
@@ -141,15 +224,28 @@ final class RowsView: NSView {
 
     override func layout() {
         super.layout()
-        for (i, row) in rows.enumerated() {
-            row.frame = NSRect(x: 0, y: CGFloat(i) * Self.rowHeight, width: bounds.width, height: Self.rowHeight)
+        if horizontal {
+            for (column, section) in sections.enumerated() {
+                for (rowIndex, row) in section.enumerated() {
+                    row.frame = NSRect(
+                        x: CGFloat(column) * Self.columnWidth,
+                        y: CGFloat(rowIndex) * Self.rowHeight,
+                        width: Self.columnWidth,
+                        height: Self.rowHeight
+                    )
+                }
+            }
+        } else {
+            for (rowIndex, row) in rows.enumerated() {
+                row.frame = NSRect(
+                    x: 0,
+                    y: CGFloat(rowIndex) * Self.rowHeight,
+                    width: bounds.width,
+                    height: Self.rowHeight
+                )
+            }
         }
         window?.invalidateCursorRects(for: self)
     }
-}
 
-/// Covers the panel while a confirm card shows. Absorbs clicks so rows below get none.
-final class OverlayView: NSView {
-    override func mouseDown(with event: NSEvent) {}
-    override func scrollWheel(with event: NSEvent) {}
 }

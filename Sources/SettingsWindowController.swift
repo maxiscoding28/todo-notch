@@ -1,4 +1,5 @@
 import AppKit
+import ServiceManagement
 
 /// Edits the todo file path and the folder sources that become sections.
 final class SettingsWindowController: NSObject, NSWindowDelegate, NSTextFieldDelegate {
@@ -7,11 +8,17 @@ final class SettingsWindowController: NSObject, NSWindowDelegate, NSTextFieldDel
     private var window: NSWindow!
 
     private let fileField = NSTextField()
+    private let layoutControl = NSSegmentedControl(
+        labels: ["Vertical", "Horizontal"], trackingMode: .selectOne, target: nil, action: nil
+    )
+    private let loginBox = NSButton(checkboxWithTitle: "Open at login", target: nil, action: nil)
     private let sourcesStack = NSStackView()
     private let previewLabel = NSTextField(wrappingLabelWithString: "")
     private let applyButton = NSButton(title: "Apply", target: nil, action: nil)
     private let cancelButton = NSButton(title: "Cancel", target: nil, action: nil)
-    private var overlay: NSView?
+    private var confirmation: NSAlert?
+    private var previewWork: DispatchWorkItem?
+    private var cachedRequired: [String] = []
 
     init(panelController: TodoPanelController) {
         self.panelController = panelController
@@ -36,7 +43,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate, NSTextFieldDel
 
     private func buildWindow() {
         window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 560, height: 420),
+            contentRect: NSRect(x: 0, y: 0, width: 560, height: 510),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
@@ -54,6 +61,15 @@ final class SettingsWindowController: NSObject, NSWindowDelegate, NSTextFieldDel
         let chooseFile = NSButton(title: "Choose…", target: self, action: #selector(chooseFile))
         let fileRow = NSStackView(views: [fileField, chooseFile])
         fileRow.spacing = 8
+
+        let layoutTitle = sectionTitle("Section layout")
+        layoutControl.target = self
+        layoutControl.action = #selector(layoutChanged)
+        let layoutHelp = helpLabel("Place sections in one list or in side-by-side columns.")
+
+        let startupTitle = sectionTitle("Startup")
+        loginBox.target = self
+        loginBox.action = #selector(loginToggled(_:))
 
         let sourcesTitle = sectionTitle("Sections from folders")
         let sourcesHelp = helpLabel(
@@ -83,31 +99,49 @@ final class SettingsWindowController: NSObject, NSWindowDelegate, NSTextFieldDel
         buttons.spacing = 8
 
         let main = NSStackView(views: [
-            fileTitle, fileRow, sourcesTitle, sourcesHelp, sourcesStack, addRow, previewLabel, keepNote,
+            fileTitle, fileRow, layoutTitle, layoutControl, layoutHelp,
+            startupTitle, loginBox,
+            sourcesTitle, sourcesHelp, sourcesStack, addRow, previewLabel, keepNote,
         ])
         main.orientation = .vertical
         main.alignment = .leading
         main.spacing = 8
         main.setCustomSpacing(20, after: fileRow)
+        main.setCustomSpacing(20, after: layoutHelp)
+        main.setCustomSpacing(20, after: loginBox)
         main.setCustomSpacing(14, after: addRow)
 
-        for v in [main, buttons] as [NSView] {
+        let scroll = NSScrollView()
+        scroll.hasVerticalScroller = true
+        scroll.autohidesScrollers = true
+        scroll.drawsBackground = false
+        let document = FlippedView()
+        scroll.documentView = document
+        main.translatesAutoresizingMaskIntoConstraints = false
+        document.addSubview(main)
+        for v in [scroll, buttons] as [NSView] {
             v.translatesAutoresizingMaskIntoConstraints = false
             content.addSubview(v)
         }
         NSLayoutConstraint.activate([
-            main.topAnchor.constraint(equalTo: content.topAnchor, constant: 20),
-            main.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 20),
-            main.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
+            scroll.topAnchor.constraint(equalTo: content.topAnchor, constant: 16),
+            scroll.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            scroll.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            scroll.bottomAnchor.constraint(equalTo: buttons.topAnchor, constant: -16),
+            main.topAnchor.constraint(equalTo: document.topAnchor, constant: 4),
+            main.leadingAnchor.constraint(equalTo: document.leadingAnchor, constant: 20),
+            main.trailingAnchor.constraint(equalTo: document.trailingAnchor, constant: -20),
+            main.bottomAnchor.constraint(equalTo: document.bottomAnchor, constant: -4),
             fileRow.widthAnchor.constraint(equalTo: main.widthAnchor),
             sourcesStack.widthAnchor.constraint(equalTo: main.widthAnchor),
             previewLabel.widthAnchor.constraint(equalTo: main.widthAnchor),
             sourcesHelp.widthAnchor.constraint(equalTo: main.widthAnchor),
-            buttons.topAnchor.constraint(greaterThanOrEqualTo: main.bottomAnchor, constant: 16),
             buttons.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
             buttons.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -16),
             content.widthAnchor.constraint(equalToConstant: 560),
         ])
+        document.translatesAutoresizingMaskIntoConstraints = false
+        document.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor).isActive = true
     }
 
     private func sectionTitle(_ text: String) -> NSTextField {
@@ -124,7 +158,10 @@ final class SettingsWindowController: NSObject, NSWindowDelegate, NSTextFieldDel
     }
 
     private func reloadForm() {
+        cachedRequired = draft.requiredSections()
         fileField.stringValue = draft.todoFile
+        layoutControl.selectedSegment = draft.sectionLayout == .vertical ? 0 : 1
+        loginBox.state = SMAppService.mainApp.status == .enabled ? .on : .off
         sourcesStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
         if draft.sources.isEmpty {
             sourcesStack.addArrangedSubview(helpLabel("No folder sources. Only sections typed in the file show."))
@@ -169,7 +206,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate, NSTextFieldDel
     }
 
     private func updatePreview() {
-        let preview = panelController.preview(draft)
+        let preview = panelController.preview(draft, required: cachedRequired)
         let list = preview.sections.isEmpty ? "none" : preview.sections.joined(separator: ", ")
         previewLabel.stringValue = "Sections after Apply: " + list
     }
@@ -178,7 +215,27 @@ final class SettingsWindowController: NSObject, NSWindowDelegate, NSTextFieldDel
 
     func controlTextDidChange(_ obj: Notification) {
         draft.todoFile = fileField.stringValue.trimmingCharacters(in: .whitespaces)
-        updatePreview()
+        previewWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.updatePreview() }
+        previewWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: work)
+    }
+
+    @objc private func layoutChanged() {
+        draft.sectionLayout = layoutControl.selectedSegment == 1 ? .horizontal : .vertical
+    }
+
+    @objc private func loginToggled(_ sender: NSButton) {
+        do {
+            if sender.state == .on {
+                try SMAppService.mainApp.register()
+            } else {
+                try SMAppService.mainApp.unregister()
+            }
+        } catch {
+            NSSound.beep()
+        }
+        sender.state = SMAppService.mainApp.status == .enabled ? .on : .off
     }
 
     @objc private func chooseFile() {
@@ -259,71 +316,25 @@ final class SettingsWindowController: NSObject, NSWindowDelegate, NSTextFieldDel
         }
         lines.append("Tasks are kept.")
 
-        guard let content = window.contentView else { return }
-        let dim = OverlayView()
-        dim.wantsLayer = true
-        dim.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.35).cgColor
-        let card = NSView()
-        card.wantsLayer = true
-        card.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
-        card.layer?.cornerRadius = 10
-        card.layer?.borderWidth = 0.5
-        card.layer?.borderColor = NSColor.separatorColor.cgColor
-
-        let title = NSTextField(labelWithString: "Reorganize the todo file?")
-        title.font = .systemFont(ofSize: 13, weight: .semibold)
-        let detail = NSTextField(wrappingLabelWithString: lines.joined(separator: "\n"))
-        detail.font = .systemFont(ofSize: 11)
-        detail.textColor = .secondaryLabelColor
-        let back = NSButton(title: "Cancel  esc", target: self, action: #selector(hideOverlay))
-        let ok = NSButton(title: "Apply  ↩", target: self, action: #selector(confirmApply))
-        back.keyEquivalent = "\u{1b}"
-        ok.keyEquivalent = "\r"
-        applyButton.keyEquivalent = ""
-        cancelButton.keyEquivalent = ""
-
-        for v in [title, detail, back, ok] as [NSView] {
-            v.translatesAutoresizingMaskIntoConstraints = false
-            card.addSubview(v)
+        let alert = NSAlert()
+        alert.messageText = "Reorganize the todo file?"
+        alert.informativeText = lines.joined(separator: "\n")
+        alert.addButton(withTitle: "Apply")
+        alert.addButton(withTitle: "Cancel")
+        confirmation = alert
+        alert.beginSheetModal(for: window) { [weak self] response in
+            self?.confirmation = nil
+            if response == .alertFirstButtonReturn { self?.commit() }
         }
-        card.translatesAutoresizingMaskIntoConstraints = false
-        dim.translatesAutoresizingMaskIntoConstraints = false
-        dim.addSubview(card)
-        content.addSubview(dim)
-        NSLayoutConstraint.activate([
-            dim.topAnchor.constraint(equalTo: content.topAnchor),
-            dim.bottomAnchor.constraint(equalTo: content.bottomAnchor),
-            dim.leadingAnchor.constraint(equalTo: content.leadingAnchor),
-            dim.trailingAnchor.constraint(equalTo: content.trailingAnchor),
-            card.centerXAnchor.constraint(equalTo: dim.centerXAnchor),
-            card.centerYAnchor.constraint(equalTo: dim.centerYAnchor),
-            card.widthAnchor.constraint(equalToConstant: 400),
-            title.topAnchor.constraint(equalTo: card.topAnchor, constant: 14),
-            title.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 16),
-            detail.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 6),
-            detail.leadingAnchor.constraint(equalTo: title.leadingAnchor),
-            detail.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -16),
-            ok.topAnchor.constraint(equalTo: detail.bottomAnchor, constant: 12),
-            ok.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -12),
-            ok.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -12),
-            back.centerYAnchor.constraint(equalTo: ok.centerYAnchor),
-            back.trailingAnchor.constraint(equalTo: ok.leadingAnchor, constant: -8),
-        ])
-        overlay = dim
-    }
-
-    @objc private func confirmApply() {
-        commit()
     }
 
     @objc private func hideOverlay() {
-        overlay?.removeFromSuperview()
-        overlay = nil
-        applyButton.keyEquivalent = "\r"
-        cancelButton.keyEquivalent = "\u{1b}"
+        if let alert = confirmation { window.endSheet(alert.window) }
+        confirmation = nil
     }
 
     func windowWillClose(_ notification: Notification) {
+        previewWork?.cancel()
         hideOverlay()
     }
 }

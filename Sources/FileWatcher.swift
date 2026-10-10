@@ -4,6 +4,8 @@ import Foundation
 final class FileWatcher {
     private let path: String
     private var source: DispatchSourceFileSystemObject?
+    private var retry: DispatchWorkItem?
+    private var generation = 0
     var onChange: (() -> Void)?
 
     init(path: String) {
@@ -14,7 +16,7 @@ final class FileWatcher {
         stop()
         let fd = open(path, O_EVTONLY)
         guard fd >= 0 else {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in self?.start() }
+            scheduleRestart(after: 2)
             return
         }
         let src = DispatchSource.makeFileSystemObjectSource(
@@ -26,10 +28,7 @@ final class FileWatcher {
             guard let self, let src else { return }
             let flags = src.data
             if flags.contains(.delete) || flags.contains(.rename) {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                    self.start()
-                    self.onChange?()
-                }
+                self.scheduleRestart(after: 0.05)
             } else {
                 self.onChange?()
             }
@@ -40,7 +39,24 @@ final class FileWatcher {
     }
 
     func stop() {
+        generation += 1
+        retry?.cancel()
+        retry = nil
         source?.cancel()
         source = nil
     }
+
+    private func scheduleRestart(after delay: Double) {
+        retry?.cancel()
+        let token = generation
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.generation == token else { return }
+            self.start()
+            self.onChange?()
+        }
+        retry = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+    }
+
+    deinit { stop() }
 }

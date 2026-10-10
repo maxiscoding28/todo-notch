@@ -14,6 +14,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return false
     }
 
+    func applicationWillTerminate(_ notification: Notification) {
+        controller?.panelWillClose()
+        if let hotKeyRef { UnregisterEventHotKey(hotKeyRef) }
+    }
+
     /// Registers Control-Option-T as a global hotkey. Carbon hotkeys need no accessibility permission.
     private func registerHotKey() {
         var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
@@ -75,6 +80,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.backgroundColor = .clear
         panel.hasShadow = true
         panel.animationBehavior = .none
+        panel.actionUndoManager.levelsOfUndo = 50
+        panel.delegate = controller
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
 
         controller.view.autoresizingMask = [.width, .height]
@@ -153,6 +160,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func appResignedActive() {
+        guard panel.attachedSheet == nil else { return }
         hidePanel()
     }
 
@@ -165,10 +173,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let left = screen.auxiliaryTopLeftArea, let right = screen.auxiliaryTopRightArea {
             anchorX = (left.maxX + right.minX) / 2
         }
-        let width = min(380, visible.width - 20)
+        let width = min(controller.preferredWidth(), visible.width - 20)
         let height = min(controller.preferredHeight(), visible.height - 12)
         let topY = screen.frame.maxY - menuBarHeight
         let x = max(visible.minX + 8, min(anchorX - width / 2, visible.maxX - width - 8))
-        panel.setFrame(NSRect(x: x, y: topY - height, width: width, height: height), display: true)
+        let frame = NSRect(x: x, y: topY - height, width: width, height: height)
+        guard frame != panel.frame else { return }
+        if panel.isVisible {
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 0 : 0.12
+                panel.animator().setFrame(frame, display: true)
+            }
+        } else { panel.setFrame(frame, display: true) }
     }
 }

@@ -5,7 +5,9 @@
 A small macOS menu bar app. Click the icon, or press **⌃⌥T**, and a todo list drops down from the notch.
 
 - Checkbox list with nested sub-tasks.
+- Checked tasks fade out after 2.5 seconds. Command-Z restores the most recent task.
 - Collapsible sections. A collapsed section shows a badge with its count of open tasks.
+- Sections with more open top-level todos appear first. Equal counts keep file order.
 - Sections can mirror folders on disk. For example, one section for each project folder.
 - The data is one plain text file. You can edit it in any editor, and the app picks up the changes.
 
@@ -21,7 +23,7 @@ make install
 
 This builds `TodoNotch.app`, copies it to `/Applications`, and starts it.
 
-To start it at login, open the panel and tick **Open at login**.
+To start it at login, enable **Open at login** in Settings.
 
 If you download a release zip instead, macOS blocks the app because it is not notarized. Right-click the app, select **Open**, then confirm. Or run:
 
@@ -37,6 +39,8 @@ xattr -d com.apple.quarantine /Applications/TodoNotch.app
 | ↑ ↓ | Move to the previous or next task |
 | Return | Add a task below |
 | Tab / ⇧Tab | Nest or un-nest the task |
+| ⇧⌘L | Switch the section layout |
+| ⌘Z / ⇧⌘Z | Undo or redo text edits and task removal |
 | ⌘A, then Delete | Clear the task. If it has sub-tasks, the app asks first |
 | Delete on an empty task | Remove it |
 | Esc | Close |
@@ -53,6 +57,8 @@ If the menu bar is full, macOS can hide the icon behind the notch. Use ⌃⌥T i
 Open Settings with ⌘, while the panel is open, or right-click the menu bar icon. Settings sets two things:
 
 - **Todo file**: the text file to use. The default is `~/todo.txt`. The app creates it if it does not exist.
+- **Section layout**: show sections in one vertical list or in horizontal columns.
+- **Open at login**: start TodoNotch when you sign in.
 - **Sections from folders**:
   - **Contents of** a folder makes one section for each folder inside it.
   - **Folder** makes one section, named after that folder.
@@ -81,7 +87,7 @@ personal
 | Command | Action |
 |---|---|
 | `make install` | Build, install to /Applications, and start |
-| `make selftest` | Check that the file format reads and writes without change |
+| `make selftest` | Run isolated model and AppKit regression tests |
 | `make dist` | Build `TodoNotch.zip` to share |
 | `make icon` | Draw the icon again from `scripts/make-icon.swift` |
 

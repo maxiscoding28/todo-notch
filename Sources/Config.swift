@@ -43,9 +43,15 @@ struct ConfigPreview {
     var changesStructure: Bool { newFile || !added.isEmpty || !removed.isEmpty || !unsynced.isEmpty }
 }
 
+enum SectionLayout: String, Codable {
+    case vertical
+    case horizontal
+}
+
 struct Config: Codable, Equatable {
     var todoFile: String
     var sources: [SectionSource]
+    var sectionLayout: SectionLayout
 
     static let defaultsKey = "config"
     static let bundleID = "local.maxwinslow.todo-notch"
@@ -57,7 +63,26 @@ struct Config: Codable, Equatable {
     static let didChange = Notification.Name("TodoNotchConfigDidChange")
 
     /// First-run setup: one file and no folder sources. Settings changes both.
-    static let initial = Config(todoFile: "~/todo.txt", sources: [])
+    static let initial = Config(todoFile: "~/todo.txt", sources: [], sectionLayout: .vertical)
+
+    enum CodingKeys: String, CodingKey {
+        case todoFile
+        case sources
+        case sectionLayout
+    }
+
+    init(todoFile: String, sources: [SectionSource], sectionLayout: SectionLayout = .vertical) {
+        self.todoFile = todoFile
+        self.sources = sources
+        self.sectionLayout = sectionLayout
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        todoFile = try values.decode(String.self, forKey: .todoFile)
+        sources = try values.decode([SectionSource].self, forKey: .sources)
+        sectionLayout = try values.decodeIfPresent(SectionLayout.self, forKey: .sectionLayout) ?? .vertical
+    }
 
     var todoURL: URL { URL(fileURLWithPath: (todoFile as NSString).expandingTildeInPath) }
 
@@ -70,6 +95,11 @@ struct Config: Codable, Equatable {
     static func load() -> Config {
         guard let data = store.data(forKey: defaultsKey),
               let config = try? JSONDecoder().decode(Config.self, from: data) else { return initial }
+        if let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           object["sectionOrder"] != nil,
+           let cleaned = try? JSONEncoder().encode(config) {
+            store.set(cleaned, forKey: defaultsKey)
+        }
         return config
     }
 
@@ -84,6 +114,7 @@ struct Config: Codable, Equatable {
     static func displayPath(_ url: URL) -> String {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         let path = url.standardizedFileURL.path
-        return path.hasPrefix(home) ? "~" + path.dropFirst(home.count) : path
+        if path == home { return "~" }
+        return path.hasPrefix(home + "/") ? "~" + path.dropFirst(home.count) : path
     }
 }

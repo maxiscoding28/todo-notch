@@ -21,7 +21,8 @@ icon:
 
 selftest:
 	swift build
-	.build/debug/todo-notch --selftest
+	swiftc $(filter-out Sources/main.swift,$(wildcard Sources/*.swift)) Tests/TodoNotchTests.swift -o .build/regression-tests
+	.build/regression-tests
 
 install: app
 	-pkill -x todo-notch
